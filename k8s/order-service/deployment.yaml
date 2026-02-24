@@ -29,7 +29,7 @@ spec:
     spec:
       containers:
         - name: order-service
-          image: us-central1-docker.pkg.dev/brilliant-tide-453616-r9/ecommerce-repo/order-service:latest
+          image: us-central1-docker.pkg.dev/friendly-drake-472209-s2/ecommerce-repo/order-service:latest
           imagePullPolicy: Always
           ports:
             - name: http
