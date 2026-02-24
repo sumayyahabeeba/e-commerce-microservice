@@ -25,7 +25,7 @@ spec:
     spec:
       containers:
         - name: api-gateway
-          image: us-central1-docker.pkg.dev/brilliant-tide-453616-r9/ecommerce-repo/api-gateway:latest
+          image: us-central1-docker.pkg.dev/friendly-drake-472209-s2/ecommerce-repo/api-gateway:latest
           imagePullPolicy: Always
           ports:
             - name: http
