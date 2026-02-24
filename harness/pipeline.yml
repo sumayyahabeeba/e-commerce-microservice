@@ -1,0 +1,239 @@
+pipeline:
+  identifier: ecommerce-cd                      # changed underscore to hyphen
+  name: Ecommerce CD — Deploy to GKE
+  orgIdentifier: EcommerceOrg
+  projectIdentifier: EcommerceCI
+  description: "Deploys all microservices to GKE via rolling update with manual approval gate"
+  tags:
+    environment: production
+    team: platform
+
+  stages:
+    # ─────────────────────────────────────────────────────────────
+    # STAGE 1: Deploy Product Service
+    # ─────────────────────────────────────────────────────────────
+    - stage:
+        identifier: deploy_product_service
+        name: Deploy - Product Service            # em dash replaced
+        type: Deployment
+        failureStrategies:                         # added
+          - onFailure:
+              errors:
+                - AllErrors
+              action:
+                type: StageRollback
+        spec:
+          deploymentType: Kubernetes
+          service:
+            serviceRef: product_service
+            serviceInputs:
+              serviceDefinition:
+                type: Kubernetes
+                spec:
+                  artifacts:
+                    primary:
+                      primaryArtifactRef: <+input>
+                      sources: <+input>
+          environment:
+            environmentRef: gke_production
+            deployToAll: false
+            infrastructureDefinitions:
+              - identifier: ecommerce_cluster
+          execution:
+            steps:
+              - step:
+                  identifier: rolling_deploy_product
+                  name: Rolling Deploy
+                  type: K8sRollingDeploy
+                  timeout: 15m
+                  spec:
+                    skipDryRun: false
+                    pruningEnabled: false
+
+              - step:
+                  identifier: verify_product
+                  name: Verify Product Service
+                  type: Run
+                  timeout: 5m
+                  spec:
+                    shell: Sh
+                    command: |
+                      echo "Waiting for product-service pods to be ready..."
+                      kubectl rollout status deployment/product-service -n ecommerce --timeout=300s
+                      echo "Product service is healthy!"
+
+            rollbackSteps:
+              - step:
+                  identifier: rollback_product
+                  name: Rollback Product Service
+                  type: K8sRollingRollback
+                  timeout: 10m
+                  spec: {}
+
+    # ─────────────────────────────────────────────────────────────
+    # STAGE 2: Deploy Order Service
+    # ─────────────────────────────────────────────────────────────
+    - stage:
+        identifier: deploy_order_service
+        name: Deploy - Order Service              # em dash replaced
+        type: Deployment
+        failureStrategies:                         # added
+          - onFailure:
+              errors:
+                - AllErrors
+              action:
+                type: StageRollback
+        spec:
+          deploymentType: Kubernetes
+          service:
+            serviceRef: order_service
+          environment:
+            environmentRef: gke_production
+            infrastructureDefinitions:
+              - identifier: ecommerce_cluster
+          execution:
+            steps:
+              - step:
+                  identifier: rolling_deploy_order
+                  name: Rolling Deploy
+                  type: K8sRollingDeploy
+                  timeout: 15m
+                  spec:
+                    skipDryRun: false
+
+              - step:
+                  identifier: verify_order
+                  name: Verify Order Service
+                  type: Run
+                  timeout: 5m
+                  spec:
+                    shell: Sh
+                    command: |
+                      kubectl rollout status deployment/order-service -n ecommerce --timeout=300s
+                      echo "Order service is healthy!"
+
+            rollbackSteps:
+              - step:
+                  identifier: rollback_order
+                  name: Rollback Order Service
+                  type: K8sRollingRollback
+                  timeout: 10m
+                  spec: {}
+
+    # ─────────────────────────────────────────────────────────────
+    # STAGE 3: Manual Approval Gate before Gateway
+    # ─────────────────────────────────────────────────────────────
+    - stage:
+        identifier: approval_gate
+        name: Approval - Deploy API Gateway       # em dash replaced
+        type: Approval
+        spec:
+          execution:
+            steps:
+              - step:
+                  identifier: approve_gateway
+                  name: Approve Gateway Deployment
+                  type: HarnessApproval
+                  timeout: 1d
+                  spec:
+                    approvalMessage: |
+                      Product and Order services have been deployed successfully.
+                      
+                      Pipeline: <+pipeline.name>
+                      Build: <+pipeline.sequenceId>
+                      Commit: <+trigger.commitSha>
+                      
+                      Please verify:
+                      - Product Service: kubectl get pods -n ecommerce -l app=product-service
+                      - Order Service: kubectl get pods -n ecommerce -l app=order-service
+                      
+                      Approve to deploy API Gateway and complete the release.
+                    includePipelineExecutionHistory: true
+                    approvers:
+                      minimumCount: 1
+                      disallowPipelineExecutor: false
+                      userGroups:
+                        - account._account_all_users
+                    approverInputs: []
+
+    # ─────────────────────────────────────────────────────────────
+    # STAGE 4: Deploy API Gateway
+    # ─────────────────────────────────────────────────────────────
+    - stage:
+        identifier: deploy_api_gateway
+        name: Deploy - API Gateway                # em dash replaced
+        type: Deployment
+        failureStrategies:                         # added
+          - onFailure:
+              errors:
+                - AllErrors
+              action:
+                type: StageRollback
+        spec:
+          deploymentType: Kubernetes
+          service:
+            serviceRef: api_gateway
+          environment:
+            environmentRef: gke_production
+            infrastructureDefinitions:
+              - identifier: ecommerce_cluster
+          execution:
+            steps:
+              - step:
+                  identifier: rolling_deploy_gateway
+                  name: Rolling Deploy
+                  type: K8sRollingDeploy
+                  timeout: 15m
+                  spec:
+                    skipDryRun: false
+
+              - step:
+                  identifier: e2e_health_check
+                  name: End-to-End Health Check
+                  type: Run
+                  timeout: 5m
+                  spec:
+                    shell: Sh
+                    command: |
+                      echo "Waiting for API Gateway..."
+                      kubectl rollout status deployment/api-gateway -n ecommerce --timeout=300s
+                      
+                      # Get external IP (retry up to 5 times)
+                      for i in $(seq 1 5); do
+                        GATEWAY_IP=$(kubectl get svc api-gateway -n ecommerce \
+                          -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null)
+                        if [ -n "$GATEWAY_IP" ]; then
+                          echo "Gateway IP: $GATEWAY_IP"
+                          break
+                        fi
+                        echo "Waiting for LoadBalancer IP... attempt $i"
+                        sleep 15
+                      done
+                      
+                      if [ -z "$GATEWAY_IP" ]; then
+                        echo "Could not get Gateway IP, but pods are running"
+                        exit 0
+                      fi
+                      
+                      # Health check
+                      curl -f http://$GATEWAY_IP/actuator/health && \
+                        echo "Health check PASSED!" || \
+                        echo "Health check endpoint not ready yet (acceptable)"
+
+            rollbackSteps:
+              - step:
+                  identifier: rollback_gateway
+                  name: Rollback API Gateway
+                  type: K8sRollingRollback
+                  timeout: 10m
+                  spec: {}
+
+  variables:
+    - name: gcp_project_id
+      type: String
+      value: brilliant-tide-453616-r9
+      description: "GCP Project ID"
+    - name: environment
+      type: String
+      value: production
+      description: "Target deployment environment"

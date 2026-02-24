@@ -1,0 +1,158 @@
+name: CI — Build, Test & Push to GAR
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+  pull_request:
+    branches:
+      - main
+
+env:
+  GAR_LOCATION: us-central1
+  GAR_REPO: ecommerce-repo
+  PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+
+jobs:
+  # ─────────────────────────────────────────────────────────────
+  # JOB 1: Run Tests for all services in parallel
+  # ─────────────────────────────────────────────────────────────
+  test:
+    name: Test — ${{ matrix.service }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: [product-service, order-service, api-gateway]
+      fail-fast: false
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: maven
+
+      - name: Run Tests
+        run: |
+          cd ${{ matrix.service }}
+          mvn clean test -B
+
+      - name: Upload test reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results-${{ matrix.service }}
+          path: ${{ matrix.service }}/target/surefire-reports/
+
+  # ─────────────────────────────────────────────────────────────
+  # JOB 2: Build & Push Docker images (only on push to main)
+  # ─────────────────────────────────────────────────────────────
+  build-and-push:
+    name: Build & Push — ${{ matrix.service }}
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    strategy:
+      matrix:
+        include:
+          - service: product-service
+            port: 8081
+          - service: order-service
+            port: 8082
+          - service: api-gateway
+            port: 8080
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        run: |
+          gcloud auth configure-docker ${{ env.GAR_LOCATION }}-docker.pkg.dev --quiet
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Set image tag variables
+        id: vars
+        run: |
+          echo "IMAGE_TAG=${{ github.sha }}" >> $GITHUB_OUTPUT
+          echo "IMAGE_URI=${{ env.GAR_LOCATION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.GAR_REPO }}/${{ matrix.service }}" >> $GITHUB_OUTPUT
+
+      - name: Build and Push Docker Image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./${{ matrix.service }}
+          file: ./${{ matrix.service }}/Dockerfile
+          push: true
+          tags: |
+            ${{ steps.vars.outputs.IMAGE_URI }}:${{ steps.vars.outputs.IMAGE_TAG }}
+            ${{ steps.vars.outputs.IMAGE_URI }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Update Kubernetes manifest with new image tag
+        run: |
+          IMAGE_PATH="${{ steps.vars.outputs.IMAGE_URI }}:${{ steps.vars.outputs.IMAGE_TAG }}"
+          
+          # Replace the image line in deployment.yaml
+          sed -i "s|image:.*${{ matrix.service }}:.*|image: $IMAGE_PATH|g" \
+            k8s/${{ matrix.service }}/deployment.yaml
+          
+          echo "Updated k8s/${{ matrix.service }}/deployment.yaml with image: $IMAGE_PATH"
+
+      - name: Commit and push manifest changes
+        run: |
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global user.name "GitHub Actions Bot"
+          
+          git add k8s/${{ matrix.service }}/deployment.yaml
+          
+          if git diff --staged --quiet; then
+            echo "No manifest changes to commit"
+          else
+            git commit -m "ci: update ${{ matrix.service }} image to ${{ github.sha }} [skip ci]"
+            git push
+          fi
+
+  # ─────────────────────────────────────────────────────────────
+  # JOB 3: Trigger Harness CD Pipeline after all builds succeed
+  # ─────────────────────────────────────────────────────────────
+  trigger-harness-deploy:
+    name: Trigger Harness CD Pipeline
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Trigger Harness CD via API
+        run: |
+          curl -s -X POST \
+            "https://app.harness.io/pipeline/api/pipeline/execute/${{ secrets.HARNESS_PIPELINE_ID }}?accountIdentifier=${{ secrets.HARNESS_ACCOUNT_ID }}&orgIdentifier=EcommerceOrg&projectIdentifier=EcommerceCI" \
+            -H "x-api-key: ${{ secrets.HARNESS_API_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "inputSetReferences": [],
+              "triggerPayload": {
+                "type": "GIT",
+                "gitPayload": {
+                  "commitId": "${{ github.sha }}",
+                  "ref": "${{ github.ref }}"
+                }
+              }
+            }'
